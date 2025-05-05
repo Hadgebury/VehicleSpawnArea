@@ -1,7 +1,7 @@
 fx_version 'cerulean'
 game 'gta5'
 author 'Hadgebury'
-description 'Vehicle Spawn Zone using ox_lib'
+description 'Vehicle Spawn Area script using ox_lib'
 
 -- Enable Lua 5.4 (required for ox_lib)
 lua54 'yes'
