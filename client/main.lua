@@ -3,39 +3,69 @@
 ║                  VehicleSpawnArea — Client                       ║
 ║                      client/main.lua                             ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Handles all client-side logic:                                  ║
-║    • ox_lib zone creation (per location and per bay)             ║
-║    • Distance-gated marker drawing                               ║
-║    • Permission-filtered context menus                           ║
-║    • Vehicle spawn requests (server-authoritative)               ║
-║    • Receiving and executing server-approved spawns              ║
+║  Handles all client-side operations:                             ║
+║    • ox_lib zone management with automatic cleanup on restart    ║
+║    • Distance-gated, permission-filtered marker rendering        ║
+║    • UI text prompts and permission-filtered context menus       ║
+║    • Server-authoritative vehicle spawn dispatch                 ║
+║    • Safe vehicle entity creation, model streaming, and warping  ║
 ║                                                                  ║
-║  NOTE: Permission checks here are COSMETIC only — they filter    ║
-║  what the player sees in menus. The server performs the          ║
-║  authoritative validation before any vehicle is created.         ║
+║  CRITICAL STABILITY NOTES:                                       ║
+║    • All server-approved spawn handlers run in coroutines        ║
+║      (CreateThread) to avoid C-call boundary yield crashes.      ║
+║    • onResourceStop cleans up all ox_lib zones and active text   ║
+║      prompts to prevent ghost triggers across resource restarts. ║
+║                                                                  ║
+║  Note: All comments and non-code text adhere to British English. ║
 ╚══════════════════════════════════════════════════════════════════╝
 --]]
 
 -- ============================================================
--- LOCAL STATE
+-- LOCAL STATE MANAGEMENT
 -- ============================================================
 
---- Holds references to every ox_lib zone created at startup,
---- allowing them to be destroyed cleanly if required.
+--- Holds references to all registered ox_lib zones for clean lifecycle teardown.
 local activeZones = {}
 
+--- Tracks the current active interaction zone the player is standing inside.
+--- Set on zone entry, cleared on zone exit. Eliminates redundant distance scans.
+local currentZone = nil
+
+-- Forward declaration of local menu functions to allow mutual referencing
+local OpenVehicleMenu
+local OpenBaySelectionMenu
+local OpenBayDirectMenu
+
 -- ============================================================
--- PERMISSION CHECKING (Client-side — cosmetic filter only)
+-- HELPER: COLOUR RESOLUTION
 -- ============================================================
 
---- Checks whether the local player passes a permission gate.
---- Used to hide restricted locations or vehicles in menus.
---- The server re-validates before any actual spawn occurs.
+--- Resolves RGB colour values from a marker configuration table,
+--- transparently supporting both British ('colour') and legacy ('color') keys.
 ---
----@param perms table  Config table with optional fields: ace, jobs, minGrade
----@return boolean     true if the player should see / use this option
+---@param marker table  The marker configuration table
+---@return table        RGB table with { r = number, g = number, b = number }
+local function GetMarkerColour(marker)
+    local col = marker.colour or marker.color or { r = 0, g = 255, b = 0 }
+    return {
+        r = col.r or 0,
+        g = col.g or 255,
+        b = col.b or 0,
+    }
+end
+
+-- ============================================================
+-- PERMISSION FILTERING (Client-Side — Cosmetic Only)
+-- ============================================================
+
+--- Evaluates whether the local player satisfies permission requirements.
+--- Used purely to filter menu items and hide unauthorized garages.
+--- Note: The server performs authoritative validation before any spawn occurs.
+---
+---@param perms table  Configuration table containing optional ace, jobs, minGrade
+---@return boolean     true if the local player satisfies the permission gate
 local function HasPermission(perms)
-    -- 'none' mode: skip all checks entirely
+    -- If permission mode is 'none', permit access unconditionally
     if Config.PermissionMode == 'none' then
         return true
     end
@@ -43,215 +73,256 @@ local function HasPermission(perms)
     local aceOk = false
     local jobOk = false
 
-    -- ACE check — IsPlayerAceAllowed works for the local player on the client
+    -- --------------------------------------------------------
+    -- 1. Client-Side ACE Check
+    -- --------------------------------------------------------
     if perms.ace then
         aceOk = IsPlayerAceAllowed(PlayerId(), perms.ace)
     else
-        -- No ACE string configured → ACE check passes automatically
         aceOk = true
     end
 
-    -- Job check — uses the unified Framework API from shared/framework.lua
+    -- --------------------------------------------------------
+    -- 2. Client-Side Framework Job Check
+    -- --------------------------------------------------------
     if perms.jobs and #perms.jobs > 0 then
         local playerJob = Framework.GetPlayerJob()
 
         if playerJob then
-            -- Iterate allowed jobs; pass if any match the player's job and grade
+            local requiredGrade = perms.minGrade or 0
+
             for _, allowedJob in ipairs(perms.jobs) do
-                if playerJob.name == allowedJob
-                and playerJob.grade >= (perms.minGrade or 0) then
+                if playerJob.name == allowedJob and playerJob.grade >= requiredGrade then
                     jobOk = true
                     break
                 end
             end
         else
-            -- No framework running (standalone) — skip job check
+            -- If standalone mode is active, bypass job check
             if Framework.name == 'standalone' then
                 jobOk = true
             end
         end
     else
-        -- No jobs list configured → job check passes automatically
         jobOk = true
     end
 
-    -- Evaluate against the active permission mode
+    -- --------------------------------------------------------
+    -- 3. Mode Evaluation
+    -- --------------------------------------------------------
     if Config.PermissionMode == 'ace' then
         return aceOk
     elseif Config.PermissionMode == 'job' then
         return jobOk
     elseif Config.PermissionMode == 'both' then
-        -- OR logic: satisfying either check is sufficient
         return aceOk or jobOk
     end
 
     return false
 end
 
---- Checks whether the player can spawn a specific vehicle at a given location.
---- Applies the layered permission model: location → vehicle.
+--- Determines whether the local player can spawn a specific vehicle at a location.
+--- Implements layered logic: location permission gate -> vehicle override gate.
 ---
----@param location table  The location config table
----@param vehicle  table  The vehicle config table
----@return boolean
+---@param location table  The garage location configuration table
+---@param vehicle  table  The vehicle configuration table
+---@return boolean        true if the vehicle should be presented in the menu
 local function CanSpawnVehicle(location, vehicle)
-    -- Must pass the location gate before vehicle-level checks run
+    -- Must pass the primary location check first
     if not HasPermission(location) then
         return false
     end
 
-    -- If the vehicle defines its own permissions, check those on top
+    -- If the vehicle defines specific restrictions, evaluate them
     if vehicle.ace or (vehicle.jobs and #vehicle.jobs > 0) then
         return HasPermission(vehicle)
     end
 
-    -- No vehicle-level permissions — location check was sufficient
+    -- Vehicle has no specific restrictions; inherits location approval
     return true
 end
 
 -- ============================================================
--- BAY OCCUPANCY
+-- PARKING BAY OCCUPANCY & CLEANUP
 -- ============================================================
 
---- Returns true if any vehicle is within Config.OccupiedCheckRadius of coords.
----@param coords vector3
----@return boolean
+--- Checks whether any vehicle entity is currently within the detection radius of coordinates.
+---
+---@param coords vector3  The bay coordinates to check
+---@return boolean        true if a valid vehicle is occupying the bay
 local function IsBayOccupied(coords)
     local vehicles = GetGamePool('CVehicle')
     for _, vehicle in ipairs(vehicles) do
-        if #(GetEntityCoords(vehicle) - coords) < Config.OccupiedCheckRadius then
+        if DoesEntityExist(vehicle) and #(GetEntityCoords(vehicle) - coords) < Config.OccupiedCheckRadius then
             return true
         end
     end
     return false
 end
 
---- Attempts to delete the vehicle currently occupying a bay.
---- Only removes the vehicle if the local player is its network owner
---- or if no player is currently sitting in it.
+--- Attempts to delete any existing vehicle occupying a parking bay.
+--- Requests network control and ensures passengers are not displaced.
 ---
----@param coords vector3
----@return boolean  true if a vehicle was successfully deleted
+---@param coords vector3  The bay coordinates
+---@return boolean        true if an occupying vehicle was successfully deleted
 local function DeleteVehicleInBay(coords)
     local vehicles = GetGamePool('CVehicle')
+
     for _, vehicle in ipairs(vehicles) do
-        if #(GetEntityCoords(vehicle) - coords) < Config.OccupiedCheckRadius then
-            -- Only delete if we own it or it is unoccupied
-            local driverPed = GetPedInVehicleSeat(vehicle, -1)
-            if NetworkGetEntityOwner(vehicle) == PlayerId() or driverPed == 0 then
+        if DoesEntityExist(vehicle) and #(GetEntityCoords(vehicle) - coords) < Config.OccupiedCheckRadius then
+            local driverPed      = GetPedInVehicleSeat(vehicle, -1)
+            local passengerCount = GetVehicleNumberOfPassengers(vehicle)
+
+            -- Only proceed if vehicle is unoccupied or owned by the local player
+            if NetworkGetEntityOwner(vehicle) == PlayerId() or (driverPed == 0 and passengerCount == 0) then
+                -- Request network control before issuing deletion
+                if not NetworkHasControlOfEntity(vehicle) then
+                    NetworkRequestControlOfEntity(vehicle)
+                    local timeout = GetGameTimer() + 500
+                    while not NetworkHasControlOfEntity(vehicle) and GetGameTimer() < timeout do
+                        Wait(10)
+                    end
+                end
+
                 SetEntityAsMissionEntity(vehicle, true, true)
                 DeleteVehicle(vehicle)
+
+                -- Fallback deletion native if entity persists
+                if DoesEntityExist(vehicle) then
+                    DeleteEntity(vehicle)
+                end
+
                 return true
             end
         end
     end
+
     return false
 end
 
 -- ============================================================
--- VEHICLE SPAWNING
+-- VEHICLE CREATION & STREAMING
 -- ============================================================
 
---- Spawns a vehicle at the specified coordinates and heading.
---- Called only after the server has validated and authorised the request.
+--- Safely streams the vehicle model, instantiates the entity, places it on the ground,
+--- starts the engine, and warps the player into the driver's seat.
 ---
----@param model   string|number  Vehicle model name or joaat hash
----@param coords  vector3        World position to spawn the vehicle
----@param heading number         Direction the vehicle should face (0–360)
+---@param model   string|number  Vehicle spawn model name or joaat hash
+---@param coords  vector3        World coordinates for spawning
+---@param heading number         Heading in degrees (0.0–360.0)
 local function SpawnVehicle(model, coords, heading)
-    -- Resolve the model name to a numeric hash if a string was passed
+    -- Hide active interaction text UI immediately upon spawning
+    lib.hideTextUI()
+
+    -- Resolve model hash
     local hash = type(model) == 'string' and joaat(model) or model
 
+    -- Verify that the model exists in the game streaming archive
     if not IsModelInCdimage(hash) then
-        lib.notify({ title = 'Error', description = 'Invalid vehicle model', type = 'error' })
+        lib.notify({
+            title       = 'Invalid Model',
+            description = 'Vehicle model does not exist in game archives',
+            type        = 'error',
+        })
         return
     end
 
-    -- If configured to do so, clear any existing vehicle from the bay first
+    -- If enabled, clear any existing vehicle from the bay
     if Config.DeletePreviousVehicle then
         DeleteVehicleInBay(coords)
     end
 
-    -- Re-check occupancy after any deletion attempt
+    -- Verify the bay is now clear
     if IsBayOccupied(coords) then
-        lib.notify({ title = 'Error', description = 'Bay was just occupied!', type = 'error' })
+        lib.notify({
+            title       = 'Bay Occupied',
+            description = 'The selected parking bay is currently occupied',
+            type        = 'error',
+        })
         return
     end
 
-    -- Request the model from the game's streaming system
+    -- Stream model into client memory
     RequestModel(hash)
 
-    -- Wait until the model has loaded, with a 5-second timeout to prevent
-    -- the thread hanging indefinitely if the model is invalid or missing
+    -- Await model loading with a 5-second timeout to prevent thread deadlock
     local timeout = GetGameTimer() + 5000
     while not HasModelLoaded(hash) do
         if GetGameTimer() > timeout then
-            lib.notify({ title = 'Error', description = 'Vehicle model failed to load', type = 'error' })
+            lib.notify({
+                title       = 'Streaming Timeout',
+                description = 'Vehicle model took too long to load',
+                type        = 'error',
+            })
             return
         end
         Wait(10)
     end
 
-    -- Create the vehicle in the world
+    -- Instantiate the vehicle in the game world
     local vehicle = CreateVehicle(hash, coords.x, coords.y, coords.z, heading, true, false)
 
-    -- Release the model from memory now that the vehicle entity exists
+    -- Release the streaming asset handle now that entity exists
     SetModelAsNoLongerNeeded(hash)
 
     if vehicle and DoesEntityExist(vehicle) then
-        -- Warp the player into the driver's seat (-1 = driver)
-        TaskWarpPedIntoVehicle(PlayerPedId(), vehicle, -1)
-        -- Start the engine immediately so the player doesn't need to press W first
-        SetVehicleEngineOn(vehicle, true, true, false)
-        -- Ensure the vehicle sits correctly on the ground after spawning
+        -- Position the vehicle properly upon the ground surface before ped interaction
         SetVehicleOnGroundProperly(vehicle)
+
+        -- Warp the local player ped into the driver's seat (-1)
+        TaskWarpPedIntoVehicle(PlayerPedId(), vehicle, -1)
+
+        -- Switch on the engine immediately
+        SetVehicleEngineOn(vehicle, true, true, false)
 
         lib.notify({
             title       = 'Vehicle Spawned',
-            description = ('%s ready'):format(GetDisplayNameFromVehicleModel(hash)),
+            description = ('%s is ready for departure'):format(GetDisplayNameFromVehicleModel(hash)),
             type        = 'success',
         })
     end
 end
 
 -- ============================================================
--- NETWORK EVENT HANDLERS
+-- NETWORK EVENT DISPATCHERS
 -- ============================================================
 
---- Triggered by the server after it has validated the spawn request.
---- Passes the model, spawn coordinates, and heading back to this client.
+--- Handles server-approved vehicle spawn instructions.
+--- CRITICAL: Wraps SpawnVehicle inside a CreateThread coroutine to ensure
+--- that streaming Wait() calls do not trigger engine C-call yield crashes.
 RegisterNetEvent('VehicleSpawnArea:doSpawn', function(model, coords, heading)
-    SpawnVehicle(model, vector3(coords.x, coords.y, coords.z), heading)
+    local spawnCoords = type(coords) == 'vector3' and coords or vector3(coords.x, coords.y, coords.z)
+    local spawnHeading = tonumber(heading) or 0.0
+
+    CreateThread(function()
+        SpawnVehicle(model, spawnCoords, spawnHeading)
+    end)
 end)
 
---- Receives notifications sent by the server (e.g. cooldown messages,
---- permission-denied responses) and displays them via ox_lib.
+--- Displays standard server notifications using ox_lib.
 RegisterNetEvent('VehicleSpawnArea:notify', function(data)
     lib.notify(data)
 end)
 
 -- ============================================================
--- MENU SYSTEMS
+-- CONTEXT MENUS (ox_lib)
 -- ============================================================
 
---- Opens the main vehicle selection menu for a location.
---- Called when the player presses E at the central menu interaction point.
---- Filters the vehicle list so only permitted vehicles are shown.
+--- Displays the primary vehicle selection menu for a garage location.
 ---
----@param locationId string  The location's key in Config.Locations
----@param location   table   The location config table
-local function OpenVehicleMenu(locationId, location)
+---@param locationId string  Key matching Config.Locations
+---@param location   table   Location configuration table
+OpenVehicleMenu = function(locationId, location)
     local options = {}
 
     for vehIdx, vehicle in ipairs(location.vehicles) do
         if CanSpawnVehicle(location, vehicle) then
-            -- Capture loop variables explicitly to avoid closure issues
             local capturedIdx     = vehIdx
             local capturedVehicle = vehicle
 
             table.insert(options, {
                 title       = capturedVehicle.label,
-                description = 'Select a bay to spawn this vehicle',
+                description = 'Select an available parking bay for this vehicle',
                 icon        = 'car',
                 onSelect    = function()
                     OpenBaySelectionMenu(locationId, location, capturedIdx, capturedVehicle)
@@ -260,85 +331,84 @@ local function OpenVehicleMenu(locationId, location)
         end
     end
 
+    -- If no vehicles passed permission checks, notify the player
     if #options == 0 then
         lib.notify({
-            title       = 'No Access',
-            description = 'You do not have permission to spawn any vehicles here',
+            title       = 'Authorisation Denied',
+            description = 'You do not possess permission to spawn vehicles at this location',
             type        = 'error',
         })
         return
     end
 
+    -- Hide any floating text prompt whilst viewing the menu
+    lib.hideTextUI()
+
     lib.registerContext({
-        id      = 'vsa_vehicle_menu_' .. locationId,
+        id      = 'vsa_menu_' .. locationId,
         title   = location.label .. ' — Vehicles',
         options = options,
     })
-    lib.showContext('vsa_vehicle_menu_' .. locationId)
+    lib.showContext('vsa_menu_' .. locationId)
 end
 
---- Opens the bay selection submenu after the player has chosen a vehicle.
---- Each bay is listed with its current availability (available / occupied).
+--- Displays the parking bay selection submenu for a chosen vehicle.
 ---
----@param locationId string  The location's key in Config.Locations
----@param location   table   The location config table
----@param vehIdx     number  Index of the selected vehicle in location.vehicles
----@param vehicle    table   The selected vehicle config table
-function OpenBaySelectionMenu(locationId, location, vehIdx, vehicle)
+---@param locationId string  Key matching Config.Locations
+---@param location   table   Location configuration table
+---@param vehIdx     number  Vehicle index within location.vehicles
+---@param vehicle    table   Vehicle configuration table
+OpenBaySelectionMenu = function(locationId, location, vehIdx, vehicle)
     local options = {}
 
     for bayIdx, bay in ipairs(location.bays) do
         local occupied = IsBayOccupied(bay.coords)
-        -- A bay can be used if it is free, or if we can replace the vehicle inside
         local canUse   = not occupied or Config.DeletePreviousVehicle
-
         local capturedBayIdx = bayIdx
 
         table.insert(options, {
             title       = bay.label,
             description = occupied
-                and (Config.DeletePreviousVehicle and '⚠️ Occupied — will replace' or '🚗 Occupied')
-                or  '🅿️ Available',
+                and (Config.DeletePreviousVehicle and '⚠️ Occupied — will replace existing vehicle' or '🚗 Occupied — unavailable')
+                or  '🅿️ Available for spawn',
             icon        = occupied and 'car' or 'square-parking',
             disabled    = not canUse,
             onSelect    = canUse and function()
-                -- Send the validated indices to the server; it will check
-                -- permissions and authorise (or deny) the spawn
+                -- Dispatch request to server for authoritative validation
                 TriggerServerEvent('VehicleSpawnArea:requestSpawn', locationId, vehIdx, capturedBayIdx)
             end or nil,
         })
     end
 
     lib.registerContext({
-        id      = 'vsa_bay_menu_' .. locationId,
+        id      = 'vsa_bay_select_' .. locationId,
         title   = vehicle.label .. ' — Select Bay',
-        menu    = 'vsa_vehicle_menu_' .. locationId,    -- Back button returns here
+        menu    = 'vsa_menu_' .. locationId,    -- Returns to vehicle menu on back action
         options = options,
     })
-    lib.showContext('vsa_bay_menu_' .. locationId)
+    lib.showContext('vsa_bay_select_' .. locationId)
 end
 
---- Opens a combined vehicle + bay menu when the player interacts directly
---- at a parking bay, allowing them to choose a vehicle without visiting
---- the central menu point first.
+--- Displays the direct vehicle menu when interacting directly at an individual bay.
 ---
----@param locationId string  The location's key in Config.Locations
----@param location   table   The location config table
----@param bay        table   The bay config table
----@param bayIdx     number  Index of the bay in location.bays
-local function OpenBayDirectMenu(locationId, location, bay, bayIdx)
-    -- If the bay is occupied and we are not configured to replace, bail out early
-    if IsBayOccupied(bay.coords) and not Config.DeletePreviousVehicle then
+---@param locationId string  Key matching Config.Locations
+---@param location   table   Location configuration table
+---@param bay        table   Bay configuration table
+---@param bayIdx     number  Bay index within location.bays
+OpenBayDirectMenu = function(locationId, location, bay, bayIdx)
+    local occupied = IsBayOccupied(bay.coords)
+
+    -- If bay is occupied and replacement is disabled, prevent menu display
+    if occupied and not Config.DeletePreviousVehicle then
         lib.notify({
-            title       = 'Bay Occupied',
-            description = 'This bay is currently in use',
+            title       = 'Bay In Use',
+            description = 'This parking bay is currently occupied',
             type        = 'error',
         })
         return
     end
 
-    local occupied = IsBayOccupied(bay.coords)
-    local options  = {}
+    local options = {}
 
     for vehIdx, vehicle in ipairs(location.vehicles) do
         if CanSpawnVehicle(location, vehicle) then
@@ -347,7 +417,7 @@ local function OpenBayDirectMenu(locationId, location, bay, bayIdx)
             table.insert(options, {
                 title       = vehicle.label,
                 description = occupied
-                    and ('Spawn in %s (will replace)'):format(bay.label)
+                    and ('Spawn in %s (will replace occupying vehicle)'):format(bay.label)
                     or  ('Spawn in %s'):format(bay.label),
                 icon        = 'car',
                 onSelect    = function()
@@ -359,12 +429,14 @@ local function OpenBayDirectMenu(locationId, location, bay, bayIdx)
 
     if #options == 0 then
         lib.notify({
-            title       = 'No Access',
-            description = 'You do not have permission to spawn any vehicles here',
+            title       = 'Authorisation Denied',
+            description = 'You do not possess permission to spawn vehicles at this location',
             type        = 'error',
         })
         return
     end
+
+    lib.hideTextUI()
 
     lib.registerContext({
         id      = 'vsa_bay_direct_' .. locationId .. '_' .. bayIdx,
@@ -375,70 +447,73 @@ local function OpenBayDirectMenu(locationId, location, bay, bayIdx)
 end
 
 -- ============================================================
--- MARKER DRAWING
+-- DISTANCE-GATED MARKER RENDERING
 -- ============================================================
---[[
-  Marker drawing is distance-gated to minimise GPU and CPU overhead:
-    • The thread sleeps for 500 ms when no location is within 80 metres.
-    • It drops to Wait(0) (every frame) only when the player is close enough
-      for markers to be visible, preventing unnecessary world scans when the
-      player is far away.
---]]
+-- Renders 3D world markers with dynamic distance throttling.
+-- Sleeps for 500 ms when outside 80 metres to eliminate CPU/GPU overhead.
 
 CreateThread(function()
     while true do
-        -- Default to a long sleep; shortened when near a location
-        local sleep         = 500
-        local playerCoords  = GetEntityCoords(PlayerPedId())
+        local sleep        = 500
+        local playerCoords = GetEntityCoords(PlayerPedId())
 
         for _, location in pairs(Config.Locations) do
-            local menuPoint  = location.menuPoint
-            local distToMenu = #(playerCoords - menuPoint.coords)
+            -- Only render markers if the player has permission to access the location
+            if HasPermission(location) then
+                local menuPoint  = location.menuPoint
+                local distToMenu = #(playerCoords - menuPoint.coords)
 
-            -- Only process markers for this location if within range
-            if distToMenu < 80.0 then
-                sleep = 0   -- Switch to per-frame updates while nearby
+                -- Activate frame-by-frame rendering when within 80 metres
+                if distToMenu < 80.0 then
+                    sleep = 0
 
-                -- Draw the central menu point marker
-                if distToMenu < menuPoint.marker.drawDistance then
-                    DrawMarker(
-                        menuPoint.marker.type,
-                        menuPoint.coords.x,
-                        menuPoint.coords.y,
-                        menuPoint.coords.z - 0.5,   -- Slight downward offset looks cleaner
-                        0.0, 0.0, 0.0,              -- No directional movement
-                        0.0, 0.0, 0.0,              -- No rotation
-                        menuPoint.marker.scale,
-                        menuPoint.marker.scale,
-                        menuPoint.marker.scale,
-                        menuPoint.marker.color.r,
-                        menuPoint.marker.color.g,
-                        menuPoint.marker.color.b,
-                        200,                        -- Alpha (0–255)
-                        false, true, 2, nil, nil, false
-                    )
-                end
-
-                -- Draw individual bay markers, changing colour based on occupancy
-                for _, bay in ipairs(location.bays) do
-                    if #(playerCoords - bay.coords) < 25.0 then
-                        local isOccupied = IsBayOccupied(bay.coords)
-
+                    -- ----------------------------------------
+                    -- Central Interaction Marker
+                    -- ----------------------------------------
+                    if distToMenu < menuPoint.marker.drawDistance then
+                        local col = GetMarkerColour(menuPoint.marker)
                         DrawMarker(
-                            bay.marker.type,
-                            bay.coords.x, bay.coords.y, bay.coords.z,
+                            menuPoint.marker.type,
+                            menuPoint.coords.x,
+                            menuPoint.coords.y,
+                            menuPoint.coords.z - 0.5,
                             0.0, 0.0, 0.0,
                             0.0, 0.0, 0.0,
-                            bay.marker.scale,
-                            bay.marker.scale,
-                            bay.marker.scale,
-                            -- Red (255, 0, 0) when occupied; configured colour when free
-                            isOccupied and 255 or bay.marker.color.r,
-                            isOccupied and 0   or bay.marker.color.g,
-                            isOccupied and 0   or bay.marker.color.b,
+                            menuPoint.marker.scale,
+                            menuPoint.marker.scale,
+                            menuPoint.marker.scale,
+                            col.r, col.g, col.b,
                             200,
                             false, true, 2, nil, nil, false
                         )
+                    end
+
+                    -- ----------------------------------------
+                    -- Parking Bay Markers (Occupancy Colouring)
+                    -- ----------------------------------------
+                    for _, bay in ipairs(location.bays) do
+                        if #(playerCoords - bay.coords) < 25.0 then
+                            local isOccupied = IsBayOccupied(bay.coords)
+                            local baseColour = GetMarkerColour(bay.marker)
+
+                            DrawMarker(
+                                bay.marker.type,
+                                bay.coords.x,
+                                bay.coords.y,
+                                bay.coords.z,
+                                0.0, 0.0, 0.0,
+                                0.0, 0.0, 0.0,
+                                bay.marker.scale,
+                                bay.marker.scale,
+                                bay.marker.scale,
+                                -- Red (255, 0, 0) when occupied; configured colour when free
+                                isOccupied and 255 or baseColour.r,
+                                isOccupied and 0   or baseColour.g,
+                                isOccupied and 0   or baseColour.b,
+                                200,
+                                false, true, 2, nil, nil, false
+                            )
+                        end
                     end
                 end
             end
@@ -449,28 +524,30 @@ CreateThread(function()
 end)
 
 -- ============================================================
--- ZONE CREATION (ox_lib)
+-- ZONE REGISTRATION (ox_lib)
 -- ============================================================
---[[
-  One sphere zone is created for each location's menu point, plus one
-  per parking bay. Zones drive the on-screen [E] text UI prompts.
-
-  A short initial Wait(500) gives the framework objects time to be ready
-  before any permission checks run during zone enter callbacks.
---]]
+-- Registers sphere interaction zones for menu points and bays.
+-- Manages currentZone state for zero-overhead input handling.
 
 CreateThread(function()
-    Wait(500)   -- Allow framework exports to initialise before zones are registered
+    -- Short delay to ensure framework exports are fully initialised
+    Wait(500)
 
     for locationId, location in pairs(Config.Locations) do
 
-        -- ---- Central menu point zone ----
+        -- ----------------------------------------------------
+        -- Central Interaction Point Zone
+        -- ----------------------------------------------------
         local menuZone = lib.zones.sphere({
             coords  = location.menuPoint.coords,
             radius  = location.menuPoint.radius,
             onEnter = function()
-                -- Only show the prompt if the player has access to this location
                 if HasPermission(location) then
+                    currentZone = {
+                        type       = 'menu',
+                        locationId = locationId,
+                        location   = location,
+                    }
                     lib.showTextUI(
                         '[E] ' .. location.label,
                         { position = 'left-center', icon = 'warehouse' }
@@ -478,20 +555,32 @@ CreateThread(function()
                 end
             end,
             onExit  = function()
+                if currentZone and currentZone.type == 'menu' and currentZone.locationId == locationId then
+                    currentZone = nil
+                end
                 lib.hideTextUI()
             end,
         })
         table.insert(activeZones, menuZone)
 
-        -- ---- Parking bay zones ----
+        -- ----------------------------------------------------
+        -- Individual Parking Bay Zones
+        -- ----------------------------------------------------
         for bayIdx, bay in ipairs(location.bays) do
-            local capturedBayIdx = bayIdx  -- Capture index to avoid closure issues
+            local capturedBayIdx = bayIdx
 
             local bayZone = lib.zones.sphere({
                 coords  = bay.coords,
                 radius  = 2.5,
                 onEnter = function()
                     if HasPermission(location) then
+                        currentZone = {
+                            type       = 'bay',
+                            locationId = locationId,
+                            location   = location,
+                            bay        = bay,
+                            bayIdx     = capturedBayIdx,
+                        }
                         lib.showTextUI(
                             ('[E] %s — %s'):format(location.label, bay.label),
                             { position = 'left-center', icon = 'square-parking' }
@@ -499,73 +588,63 @@ CreateThread(function()
                     end
                 end,
                 onExit  = function()
+                    if currentZone and currentZone.type == 'bay'
+                    and currentZone.locationId == locationId
+                    and currentZone.bayIdx == capturedBayIdx then
+                        currentZone = nil
+                    end
                     lib.hideTextUI()
                 end,
             })
-
-            -- Store metadata on the zone object for potential future use
-            bayZone._vsaLocationId = locationId
-            bayZone._vsaBayIdx     = capturedBayIdx
             table.insert(activeZones, bayZone)
         end
     end
 end)
 
 -- ============================================================
--- KEY HANDLING
+-- INPUT CONTROL LISTENER
 -- ============================================================
---[[
-  Polls for the E key (control 38) each frame. When pressed, the script
-  checks whether the player is inside a menu point zone or a bay zone
-  and opens the appropriate menu.
-
-  `goto continue` is used to break out of the outer location loop once
-  an interaction has been handled, preventing double-menu opens when
-  zones are close together.
---]]
+-- Listens for the [E] interaction key (Control 38).
+-- Uses tracked currentZone state instead of scanning all world coordinates.
 
 CreateThread(function()
     while true do
         Wait(0)
 
-        if IsControlJustReleased(0, 38) then    -- 38 = E key
-            local playerCoords = GetEntityCoords(PlayerPedId())
-
-            for locationId, location in pairs(Config.Locations) do
-
-                -- Check if the player is at the central menu interaction point
-                if #(playerCoords - location.menuPoint.coords) < location.menuPoint.radius then
-                    if HasPermission(location) then
-                        OpenVehicleMenu(locationId, location)
-                    else
-                        lib.notify({
-                            title       = 'No Access',
-                            description = 'You do not have permission to use this garage',
-                            type        = 'error',
-                        })
-                    end
-                    goto continue   -- Skip remaining locations once handled
-                end
-
-                -- Check if the player is standing at one of the parking bays
-                for bayIdx, bay in ipairs(location.bays) do
-                    if #(playerCoords - bay.coords) < 2.5 then
-                        if HasPermission(location) then
-                            OpenBayDirectMenu(locationId, location, bay, bayIdx)
-                        else
-                            lib.notify({
-                                title       = 'No Access',
-                                description = 'You do not have permission to use this garage',
-                                type        = 'error',
-                            })
-                        end
-                        goto continue   -- Skip remaining locations once handled
+        if IsControlJustReleased(0, 38) then    -- Control 38 corresponds to the 'E' key
+            if currentZone then
+                -- Do not open if the player is currently sitting in a vehicle
+                local playerPed = PlayerPedId()
+                if not IsPedInAnyVehicle(playerPed, false) then
+                    if currentZone.type == 'menu' then
+                        OpenVehicleMenu(currentZone.locationId, currentZone.location)
+                    elseif currentZone.type == 'bay' then
+                        OpenBayDirectMenu(currentZone.locationId, currentZone.location, currentZone.bay, currentZone.bayIdx)
                     end
                 end
             end
-
-            -- Label jumped to after an interaction is handled; Lua 5.4 goto target
-            ::continue::
         end
     end
+end)
+
+-- ============================================================
+-- RESOURCE TEARDOWN & RESTART CLEANUP
+-- ============================================================
+
+--- Cleans up registered ox_lib zones and active UI prompts when the resource stops.
+--- Prevents duplicate zones, memory leaks, and lingering UI on server restarts.
+AddEventHandler('onResourceStop', function(resourceName)
+    if GetCurrentResourceName() ~= resourceName then return end
+
+    -- Hide any open text prompt
+    lib.hideTextUI()
+
+    -- Remove all registered ox_lib zones
+    for _, zone in ipairs(activeZones) do
+        if zone and zone.remove then
+            zone:remove()
+        end
+    end
+    activeZones = {}
+    currentZone = nil
 end)

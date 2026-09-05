@@ -1,221 +1,275 @@
 # VehicleSpawnArea
 
-A multi-location, server-authoritative vehicle spawner for FiveM. Supports standalone use and auto-detects **ESX**, **QBCore**, and **QBox** frameworks. Features layered ACE and job-based permissions, configurable parking bays, and an ox_lib-powered menu system.
+A multi-location, server-authoritative vehicle spawner designed for FiveM. Out of the box, it operates seamlessly in standalone mode whilst automatically detecting **QBox**, **QBCore**, and **ESX** frameworks. It provides layered ACE and job-based permissions, configurable parking bays with dynamic occupancy detection, and an [ox_lib](https://github.com/overextended/ox_lib)-powered user interface.
 
 ---
 
 ## Features
 
-- **Multi-location** — Define as many garages as you need, each with their own vehicles, bays, and permissions
-- **Framework auto-detection** — Detects QBox → QBCore → ESX → Standalone with no manual configuration
-- **Layered permissions** — Location-level gates combined with optional per-vehicle overrides
-- **ACE & job permissions** — Use either or both; supports `'none'`, `'ace'`, `'job'`, and `'both'` modes
-- **Server-authoritative** — All spawn requests are validated server-side before the vehicle is created
-- **Anti-spam cooldown** — Configurable cooldown between spawn requests per player
-- **Dynamic bay states** — Bay markers change colour (green/red) to reflect occupancy in real time
-- **Auto vehicle replacement** — Optionally delete the previous vehicle in a bay before spawning a new one
-- **Dependency-light** — Only requires [ox_lib](https://github.com/overextended/ox_lib)
+- **Multi-Location Architecture** — Configure multiple garages across San Andreas, each with dedicated vehicles, parking bays, and permission requirements.
+- **Framework Auto-Detection** — Automatically identifies active frameworks in order of priority (`QBox` → `QBCore` → `ESX` → `Standalone`) without manual toggles.
+- **Layered Permissions** — Combines location-level access gates with optional per-vehicle permission overrides.
+- **Flexible Permission Modes** — Choose between `'none'`, `'ace'`, `'job'`, or `'both'` (OR logic, where satisfying either ACE or job grants access).
+- **Server-Authoritative Validation** — All spawn requests are independently verified server-side before vehicle entities are created, preventing unauthorized client execution.
+- **Anti-Spam Cooldown** — Configurable server-enforced cooldown timer between consecutive spawn requests to prevent spam.
+- **Dynamic Bay Occupancy** — Visual parking markers dynamically change colour (green for available, red for occupied) based on real-time vehicle collision checks.
+- **Automatic Vehicle Replacement** — Optionally replaces unoccupied or player-owned vehicles currently in a bay when spawning a new vehicle.
+- **Safe Entity Streaming** — Spawns vehicles within asynchronous coroutines, placing vehicles correctly upon the terrain and warping the player safely into the driver's seat.
+- **Clean Lifecycle Management** — Automatically purges ox_lib interaction zones and UI prompts upon resource stop or restart.
 
 ---
 
 ## Dependencies
 
-| Dependency | Required |
-|---|---|
-| [ox_lib](https://github.com/overextended/ox_lib) | ✅ Yes |
-| ESX / QBCore / QBox | ❌ Optional (standalone supported) |
+| Dependency | Status | Notes |
+|---|---|---|
+| [ox_lib](https://github.com/overextended/ox_lib) | **Mandatory** | Powers 3D zones, notifications, and context menus. |
+| **QBox** / **QBCore** / **ESX** | **Optional** | Automatically detected for job-based access; standalone mode is used if absent. |
 
 ---
 
 ## Installation
 
-1. Drop the `VehicleSpawnArea` folder into your FiveM server's `resources` directory.
-2. Add `ensure VehicleSpawnArea` to your `server.cfg`.
-3. Configure your locations, vehicles, and permissions in [`shared/config.lua`](shared/config.lua).
-4. If using ACE permissions, add the relevant ace entries to your `server.cfg` (see [Permissions](#permissions)).
-5. Restart the resource or server.
+1. Download or clone this repository into your FiveM server's `resources` directory:
+   ```bash
+   # Clone into your resources folder
+   git clone https://github.com/Hadgebury/VehicleSpawnArea.git resources/[standalone]/VehicleSpawnArea
+   ```
+2. Ensure that `ox_lib` is started prior to `VehicleSpawnArea` in your `server.cfg`:
+   ```cfg
+   # Resource execution order
+   ensure ox_lib
+   ensure VehicleSpawnArea
+   ```
+3. Customise your garages, parking bays, and fleet definitions in [`shared/config.lua`](shared/config.lua).
+4. If utilising ACE permissions, append the necessary access rules to your `server.cfg` (see [ACE Permissions](#ace-permissions)).
+5. Start or restart your server to apply changes.
 
 ---
 
-## File Structure
+## Folder Structure
 
 ```
 VehicleSpawnArea/
-├── fxmanifest.lua          — Resource manifest
-├── shared/
-│   ├── config.lua          — All user-facing configuration (edit this)
-│   └── framework.lua       — Framework auto-detection (do not edit)
+├── .gitignore              — Repository ignore rules for OS and editor artefacts
+├── fxmanifest.lua          — Resource manifest and engine specifications
+├── README.md               — Documentation and setup instructions
 ├── client/
-│   └── main.lua            — Client-side logic (zones, menus, spawning)
-└── server/
-    └── main.lua            — Server-side logic (permissions, anti-spam)
+│   └── main.lua            — Client-side zone handling, marker rendering, and vehicle creation
+├── server/
+│   └── main.lua            — Server-authoritative permission validation, cooldowns, and audit logs
+└── shared/
+    ├── config.lua          — All user-configurable settings, garages, bays, and fleet lists
+    └── framework.lua       — Unified framework auto-detection and job extraction bridge
 ```
 
 ---
 
 ## Configuration
 
-All configuration lives in [`shared/config.lua`](shared/config.lua).
+All user-facing options reside within [`shared/config.lua`](shared/config.lua).
 
 ### Global Settings
 
 ```lua
-Config.PermissionMode       = 'both'    -- 'none' | 'ace' | 'job' | 'both'
-Config.SpawnCooldown        = 5         -- Seconds between spawns per player
-Config.OccupiedCheckRadius  = 3.0       -- Radius (metres) to detect an occupied bay
-Config.DeletePreviousVehicle = true     -- Replace existing vehicle in bay on spawn
-Config.Debug                = false     -- Print permission checks to server console
+-- Select permission evaluation mode: 'none' | 'ace' | 'job' | 'both'
+Config.PermissionMode = 'both'
+
+-- Cooldown period (in seconds) enforced between consecutive spawns per player
+Config.SpawnCooldown = 5
+
+-- Detection radius (in metres) to check whether a parking bay is occupied by a vehicle
+Config.OccupiedCheckRadius = 3.0
+
+-- When true, spawning into an occupied bay deletes the existing unoccupied vehicle
+Config.DeletePreviousVehicle = true
+
+-- Enable verbose diagnostic logs in the server console (recommended only for debugging)
+Config.Debug = false
 ```
 
-### Adding a Location
+### Adding and Configuring Garages
 
-Each location is a self-contained garage entry inside `Config.Locations`:
+Garages are defined within the `Config.Locations` table. Both British English (`colour`) and legacy (`color`) keys are supported for marker styling:
 
 ```lua
 Config.Locations = {
-    ['my_garage'] = {
-        label    = 'My Garage',
+    -- Unique identifier for the garage location
+    ['police_garage'] = {
+        label = 'Mission Row Police Garage',
 
-        -- Location-level permissions
-        ace      = 'vehiclespawn.mygarage',  -- nil = no ACE check
-        jobs     = { 'mechanic' },           -- nil = no job check
-        minGrade = 0,                        -- Minimum job grade
+        -- Location-level permission requirements:
+        -- Players must have one of these jobs (at or above minGrade) OR hold the ACE permission
+        ace      = 'vehiclespawn.police',           -- ACE permission string (nil to bypass)
+        jobs     = { 'police', 'sheriff' },         -- Permitted framework jobs (nil to bypass)
+        minGrade = 0,                               -- Minimum job grade required (0 = any grade)
 
-        -- Central menu interaction point (player presses E here)
+        -- Central interaction point where players interact to open the vehicle list
         menuPoint = {
-            coords = vector3(0.0, 0.0, 0.0),
-            radius = 3.0,
+            coords = vector3(425.41, -1015.89, 29.01), -- World coordinates
+            radius = 3.0,                               -- Interaction sphere radius in metres
             marker = {
-                type         = 20,
-                scale        = 1.5,
-                color        = { r = 0, g = 200, b = 255 },
-                drawDistance = 15.0,
+                type         = 20,                      -- Marker 20: vertical rotating cylinder
+                scale        = 1.5,                     -- Diameter / scale of the marker
+                colour       = { r = 0, g = 200, b = 255 }, -- Cyan blue RGB colour
+                drawDistance = 15.0,                    -- Distance in metres at which marker renders
             },
         },
 
-        -- Parking bays
+        -- Designated parking bays where vehicles are spawned
         bays = {
             {
-                id      = 1,
-                label   = 'Bay 1',
-                coords  = vector3(0.0, 0.0, 0.0),
-                heading = 0.0,
+                id      = 1,                            -- Unique bay number
+                label   = 'Bay 1',                      -- Display label in menus
+                coords  = vector3(426.77, -1028.15, 29.0), -- World coordinates
+                heading = 5.51,                         -- Direction the vehicle will face (0.0–360.0)
                 marker  = {
-                    type  = 36,
-                    scale = 1.5,
-                    color = { r = 0, g = 255, b = 0 },
+                    type   = 36,                        -- Marker 36: garage parking symbol
+                    scale  = 1.5,                       -- Marker scale
+                    colour = { r = 0, g = 255, b = 0 }, -- Green RGB colour when bay is available
                 },
             },
         },
 
-        -- Vehicles available at this location
+        -- List of vehicles available at this location
         vehicles = {
             {
-                label = 'Sultan RS',
-                model = 'sultanrs',
-                -- Optional per-vehicle permission overrides
-                -- ace      = 'vehiclespawn.mygarage.sultan',
-                -- jobs     = { 'mechanic' },
-                -- minGrade = 2,
+                label = 'Incident Response Vehicle',
+                model = 'police',                       -- Vehicle model name or hash
+                -- Optional: vehicle-level permission overrides (stricter than location)
+                -- ace      = 'vehiclespawn.police.supervisor',
+                -- jobs     = { 'police' },
+                -- minGrade = 3,
             },
         },
     },
 }
 ```
 
-### Layered Permission Logic
-
-Permissions work in two layers:
-
-1. **Location-level** — The player must pass this to see or interact with the garage at all.
-2. **Vehicle-level** — If a vehicle has its own `ace`/`jobs` fields, those are checked *on top of* the location check. If a vehicle has no permissions defined, the location check is sufficient.
-
-When `Config.PermissionMode = 'both'`, a player must pass **ACE *or* job** (not both). This is the most common and permissive setup.
-
 ---
 
-## Permissions
+## Permissions & Authorisation
 
-### ACE Permissions
+### Layered Evaluation Model
 
-Add these lines to your `server.cfg`, adapting the group names to your setup:
+Permissions operate in two distinct tiers:
 
-```cfg
-# Grant a group access to a location
-add_ace group.police     vehiclespawn.police     allow
-add_ace group.ambulance  vehiclespawn.ambulance  allow
+1. **Location Tier** — Evaluated first. If the player does not meet location requirements, the garage remains completely inaccessible.
+2. **Vehicle Tier** — Evaluated when a specific vehicle specifies its own `ace`, `jobs`, or `minGrade` properties. If a vehicle defines no custom permissions, it inherits access from the location tier.
 
-# Grant a group access to a specific vehicle within a location
-add_ace group.police     vehiclespawn.police.k9  allow
-```
+When `Config.PermissionMode = 'both'`, a player needs to satisfy **either** the ACE check **or** the framework job check.
 
-Assign players to groups as normal:
+### ACE Permissions (`server.cfg`)
+
+Grant permissions to groups or specific players within your `server.cfg`:
 
 ```cfg
+# Grant group.police access to the police garage location
+add_ace group.police vehiclespawn.police allow
+
+# Grant group.ambulance access to the ambulance station location
+add_ace group.ambulance vehiclespawn.ambulance allow
+
+# Grant specialized ACE permission for restricted vehicles
+add_ace group.police vehiclespawn.police.k9 allow
+
+# Associate a player's identifier with a group
 add_principal identifier.steam:110000100000001 group.police
+add_principal identifier.license:40123456789abcdef0123456789abcdef0123456 group.ambulance
 ```
 
 ### Job Permissions (ESX / QBCore / QBox)
 
-Set `jobs` in the location or vehicle config. The player's job name and grade are fetched from the active framework automatically. No extra server.cfg entries are needed.
+Job permissions are checked directly against the active framework's player data. No additional entries are required in `server.cfg`:
 
 ```lua
+-- Allow any grade of police or sheriff
 jobs     = { 'police', 'sheriff' },
-minGrade = 2,  -- Grade 2 or above only
+minGrade = 0,
+
+-- Restrict to senior staff (grade 3 and above)
+jobs     = { 'police' },
+minGrade = 3,
 ```
 
 ---
 
-## Framework Support
+## Framework Support Matrix
 
-The resource auto-detects the active framework on startup, checking in this order:
+The resource auto-detects the active framework upon startup in the following sequence:
 
-| Priority | Framework | Resource Checked |
-|---|---|---|
-| 1 | QBox | `qbx_core` |
-| 2 | QBCore | `qb-core` |
-| 3 | ESX | `es_extended` |
-| 4 | Standalone | Fallback |
-
-In standalone mode, job checks are automatically skipped. Only ACE permissions apply.
+| Priority | Framework | Target Resource | Notes |
+|:---:|---|---|---|
+| **1** | **QBox** | `qbx_core` | Uses modern modular exports; extracts job and numeric grade. |
+| **2** | **QBCore** | `qb-core` | Uses shared core object; parses `PlayerData.job` table. |
+| **3** | **ESX Legacy** | `es_extended` | Uses `getSharedObject`; compatible with `xPlayer.getJob()`. |
+| **4** | **Standalone** | *Fallback* | Used when no framework is running; job checks are gracefully bypassed. |
 
 ---
 
-## Spawn Flow
+## Vehicle Streaming Note (Addon vs Vanilla)
+
+In the default configuration:
+- Standard vehicles such as `'police'` and `'ambulance'` are base Grand Theft Auto V assets that work immediately on all servers.
+- Custom models referenced in the configuration (such as `'BX21AWW'` and `'LX69AXC'`) are British emergency vehicle addon assets. If you do not stream these custom vehicle packs on your server, replace the spawn names with vanilla models (e.g. `'police2'`, `'police3'`, `'ambulance'`) or your own server's vehicle spawn codes.
+
+---
+
+## Operational Workflow
 
 ```
-Player presses E
-      │
-      ▼
-Client checks permissions (cosmetic filter — hides restricted options)
-      │
-      ▼
-Player selects vehicle + bay
-      │
-      ▼
-Client → Server: requestSpawn(locationId, vehicleIndex, bayIndex)
-      │
-      ▼
-Server validates:
-  • Location, vehicle, and bay exist
-  • Anti-spam cooldown
-  • ACE permission (IsPlayerAceAllowed)
-  • Job permission (via framework)
-      │
-      ├── FAIL → Notify client with error
-      │
-      └── PASS → Server → Client: doSpawn(model, coords, heading)
-                        │
-                        ▼
-                  Client creates vehicle, warps player in
+[ Player Approaches Area ]
+          │
+          ▼
+Cosmetic Check: Player has location access?
+  ├── NO  ──► UI prompt and markers are hidden
+  └── YES ──► Markers render; [E] prompt displays
+                    │
+                    ▼
+          [ Player Presses E ]
+                    │
+                    ▼
+Displays ox_lib Context Menu (filtered to permitted vehicles)
+                    │
+                    ▼
+          [ Player Selects Vehicle & Bay ]
+                    │
+                    ▼
+Client sends Network Event: VehicleSpawnArea:requestSpawn(locationId, vehIdx, bayIdx)
+                    │
+                    ▼
+┌─────────────────────────────────────────────────────────────┐
+│             SERVER-AUTHORITATIVE VERIFICATION               │
+│                                                             │
+│  1. Validate locationId, vehIdx, and bayIdx exist in config │
+│  2. Verify anti-spam cooldown has elapsed                   │
+│  3. Authoritatively evaluate ACE and framework job perms    │
+└─────────────────────────────────────────────────────────────┘
+          │                                   │
+       (FAIL)                              (PASS)
+          │                                   │
+          ▼                                   ▼
+Notify Client (Error)               1. Record new spawn timestamp
+                                    2. Output audit log to server console
+                                    3. TriggerClientEvent: VehicleSpawnArea:doSpawn
+                                              │
+                                              ▼
+                                    ┌───────────────────────────────────┐
+                                    │        CLIENT SPAWN THREAD        │
+                                    │                                   │
+                                    │ 1. Asynchronously stream model    │
+                                    │ 2. Clear bay if replacement is on │
+                                    │ 3. Create vehicle & align terrain │
+                                    │ 4. Warp player & start engine     │
+                                    └───────────────────────────────────┘
 ```
 
 ---
 
 ## Licence
 
-This project is open source. Feel free to modify and redistribute with credit to the original author.
+This project is open-source under standard permissive terms. You are welcome to adapt, modify, and integrate this resource into your FiveM community with credit to the original author.
 
 ---
 
-*Built by Hadgebury — requires [ox_lib](https://github.com/overextended/ox_lib)*
+*Authored by **Hadgebury** — Engineered for performance and security using [ox_lib](https://github.com/overextended/ox_lib).*

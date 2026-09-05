@@ -10,13 +10,16 @@
 ║    'none'   — No permission checks; everyone can spawn anything  ║
 ║    'ace'    — ACE permissions only (server.cfg)                  ║
 ║    'job'    — Framework job checks only (ESX / QBCore / QBox)    ║
-║    'both'   — ACE OR job (player must pass at least one)         ║
+║    'both'   — ACE OR job (player must satisfy at least one)      ║
 ║                                                                  ║
 ║  LAYERED PERMISSIONS                                             ║
 ║    1. Location-level — gates access to the entire garage         ║
 ║    2. Vehicle-level  — optional per-vehicle overrides            ║
 ║       If a vehicle has no permissions defined, the location      ║
 ║       check is sufficient to spawn it.                           ║
+║                                                                  ║
+║  NOTE: All non-code text and comments adhere to British English. ║
+║  Both 'colour' and 'color' keys are supported for marker tables. ║
 ╚══════════════════════════════════════════════════════════════════╝
 --]]
 
@@ -27,42 +30,42 @@ Config = {}
 -- ============================================================
 
 --- Controls the overall permission system.
---- 'none' | 'ace' | 'job' | 'both'
---- When 'both', a player must satisfy ACE OR job (OR logic).
+--- Supported options: 'none' | 'ace' | 'job' | 'both'
+--- When set to 'both', satisfying either ACE OR framework job is sufficient (OR logic).
 Config.PermissionMode = 'both'
 
---- Seconds a player must wait between consecutive spawn requests.
---- Prevents spam and abuse. Applied per player on the server.
+--- Cooldown period (in seconds) enforced between consecutive vehicle spawn requests.
+--- Prevents command spam and server desynchronisation. Applied per player on the server.
 Config.SpawnCooldown = 5
 
 --- Radius in metres used to determine whether a parking bay is occupied.
---- A vehicle within this distance of the bay's coords will mark it as taken.
+--- Any vehicle entity detected within this distance of the bay coordinates marks it as taken.
 Config.OccupiedCheckRadius = 3.0
 
---- When true, spawning into an occupied bay will delete the existing vehicle
---- there (if the player owns it or it is empty) before placing the new one.
---- When false, occupied bays are simply disabled in the menu.
+--- When true, attempting to spawn into an occupied bay will safely delete the
+--- existing vehicle (if unoccupied or owned by the player) before creating the new one.
+--- When false, occupied bays are marked as disabled in the selection menu.
 Config.DeletePreviousVehicle = true
 
---- When true, detailed permission check results and framework detection
---- are printed to the server console. Useful during setup; disable in production.
+--- When true, detailed permission evaluation diagnostics and framework detection
+--- messages are output to the server console. Useful during setup; disable in production.
 Config.Debug = false
 
 -- ============================================================
--- SPAWN LOCATIONS
+-- SPAWN LOCATIONS CONFIGURATION
 -- ============================================================
 --[[
-  Config.Locations is a keyed table. Each key is a unique identifier
+  Config.Locations is a keyed dictionary. Each key is a unique identifier
   for a garage location (used internally for menus and network events).
 
   Each location must contain:
-    label     (string)  — Display name shown in menus
-    ace       (string)  — ACE permission string; nil to skip ACE check
-    jobs      (table)   — Array of allowed job names; nil to skip job check
-    minGrade  (number)  — Minimum job grade; 0 = any grade
+    label     (string)  — Display name shown in menus and notifications
+    ace       (string)  — ACE permission string (e.g. 'vehiclespawn.police'); nil to bypass
+    jobs      (table)   — Array of allowed job strings (e.g. { 'police' }); nil to bypass
+    minGrade  (number)  — Minimum required job grade (0 = any grade)
     menuPoint (table)   — Central interaction point configuration
-    bays      (table)   — Array of parking bay definitions
-    vehicles  (table)   — Array of vehicle definitions
+    bays      (table)   — Array of individual parking bay definitions
+    vehicles  (table)   — Array of vehicle definitions available at this location
 
   Vehicles may optionally define their own ace / jobs / minGrade fields
   to apply stricter permissions on top of the location check.
@@ -70,42 +73,43 @@ Config.Debug = false
 
 Config.Locations = {
 
-    -- ========================================
-    -- POLICE GARAGE
-    -- ========================================
+    -- ========================================================
+    -- MISSION ROW POLICE GARAGE
+    -- ========================================================
     ['police_garage'] = {
         label = 'Police Garage',
 
-        -- Location-level: a player must be in the police or sheriff job,
-        -- OR hold the vehiclespawn.police ACE permission, to access this garage.
+        -- Location-level permission gate:
+        -- Players must possess the 'police' or 'sheriff' job, OR hold the
+        -- 'vehiclespawn.police' ACE permission, to access this garage.
         ace      = 'vehiclespawn.police',
         jobs     = { 'police', 'sheriff' },
         minGrade = 0,
 
-        -- The central point where the player presses E to open the vehicle menu.
+        -- Central interaction point where players press [E] to open the garage menu.
         menuPoint = {
             coords = vector3(425.41, -1015.89, 29.01),
             radius = 3.0,               -- Interaction radius in metres
             marker = {
-                type         = 20,      -- Marker type 20 = vertical rotating cylinder
-                scale        = 1.5,     -- Size of the marker
-                color        = { r = 0, g = 200, b = 255 },   -- Bright blue
-                drawDistance = 15.0,    -- Distance at which the marker becomes visible
+                type         = 20,      -- Marker type 20: vertical rotating cylinder
+                scale        = 1.5,     -- Diameter / scale of the marker
+                colour       = { r = 0, g = 200, b = 255 },  -- Bright cyan blue
+                drawDistance = 15.0,    -- Visible rendering distance in metres
             },
         },
 
-        -- Parking bays where vehicles will physically be created.
-        -- Markers change from green (available) to red (occupied) automatically.
+        -- Individual parking bays where vehicles are physically spawned.
+        -- Bay markers dynamically switch to red when occupied by a vehicle.
         bays = {
             {
                 id      = 1,
                 label   = 'Bay 1',
                 coords  = vector3(426.77, -1028.15, 29.0),
-                heading = 5.51,         -- Direction the vehicle will face (0–360)
+                heading = 5.51,         -- Heading angle in degrees (0.0–360.0)
                 marker  = {
-                    type  = 36,         -- Marker type 36 = garage/parking symbol
-                    scale = 1.5,
-                    color = { r = 0, g = 255, b = 0 },  -- Green when available
+                    type   = 36,        -- Marker type 36: garage / parking bay symbol
+                    scale  = 1.5,
+                    colour = { r = 0, g = 255, b = 0 },  -- Green when free
                 },
             },
             {
@@ -114,55 +118,59 @@ Config.Locations = {
                 coords  = vector3(430.88, -1027.11, 28.93),
                 heading = 5.02,
                 marker  = {
-                    type  = 36,
-                    scale = 1.5,
-                    color = { r = 0, g = 255, b = 0 },
+                    type   = 36,
+                    scale  = 1.5,
+                    colour = { r = 0, g = 255, b = 0 },
                 },
             },
         },
 
-        -- Vehicles available at this location.
-        -- Each entry requires a label (display name) and a model (spawn code).
-        -- Per-vehicle permissions are optional; comment them out to inherit
-        -- the location-level permissions instead.
+        -- Vehicles available at this garage.
+        -- Note: 'BX21AWW' is a custom British emergency vehicle model;
+        -- replace with standard vanilla spawn names (e.g. 'police', 'police2',
+        -- 'police3') if you are not streaming custom addon vehicles.
         vehicles = {
             {
                 label = '2020 Mondeo Dog Section',
                 model = 'BX21AWW',
-                -- Uncomment to restrict this vehicle further (e.g. K9 officers only):
+                -- Optional vehicle-level restriction override example:
                 -- ace      = 'vehiclespawn.police.k9',
                 -- jobs     = { 'police' },
                 -- minGrade = 2,
             },
             {
-                label = 'IRV',
+                label = 'Incident Response Vehicle (IRV)',
                 model = 'police',
-                -- No per-vehicle permissions — location check is sufficient.
+                -- No specific vehicle overrides: location check is sufficient
             },
         },
     },
 
-    -- ========================================
-    -- AMBULANCE STATION
-    -- ========================================
+    -- ========================================================
+    -- PILLBOX HILL AMBULANCE STATION
+    -- ========================================================
     ['ambulance_station'] = {
         label = 'Ambulance Station',
 
+        -- Location-level permission gate:
+        -- Access restricted to ambulance / medical staff or holders of the ACE permission.
         ace      = 'vehiclespawn.ambulance',
         jobs     = { 'ambulance', 'doctor' },
         minGrade = 0,
 
+        -- Central interaction point for opening the ambulance fleet menu.
         menuPoint = {
             coords = vector3(295.12, -587.36, 43.26),
             radius = 3.0,
             marker = {
                 type         = 20,
                 scale        = 1.5,
-                color        = { r = 255, g = 50, b = 50 },   -- Red
+                colour       = { r = 255, g = 50, b = 50 },  -- Bright red
                 drawDistance = 15.0,
             },
         },
 
+        -- Parking bays allocated for emergency medical vehicles.
         bays = {
             {
                 id      = 1,
@@ -170,41 +178,63 @@ Config.Locations = {
                 coords  = vector3(290.32, -590.15, 43.26),
                 heading = 340.0,
                 marker  = {
-                    type  = 36,
-                    scale = 1.5,
-                    color = { r = 0, g = 255, b = 0 },
+                    type   = 36,
+                    scale  = 1.5,
+                    colour = { r = 0, g = 255, b = 0 },
                 },
             },
         },
 
+        -- Vehicles available at the ambulance station.
+        -- Note: 'LX69AXC' is an addon UK ambulance; replace with 'ambulance'
+        -- if testing without addon emergency vehicle packs.
         vehicles = {
             {
-                label = 'Ambulance',
+                label = 'Emergency Ambulance (Custom)',
                 model = 'LX69AXC',
+            },
+            {
+                label = 'Standard Ambulance (Vanilla)',
+                model = 'ambulance',
             },
         },
     },
 
-    -- ========================================
-    -- EXAMPLE: CIVILIAN GARAGE (open to all)
-    -- ========================================
-    -- Uncomment and populate to add an unrestricted public garage.
+    -- ========================================================
+    -- TEMPLATE: UNRESTRICTED PUBLIC / CIVILIAN GARAGE
+    -- ========================================================
+    -- Uncomment and adjust coordinates to deploy a public garage open to all players.
     -- ['civilian_garage'] = {
-    --     label    = 'Civilian Garage',
-    --     ace      = nil,     -- No ACE required
-    --     jobs     = nil,     -- No job required
+    --     label    = 'Legion Square Garage',
+    --     ace      = nil,     -- Nil indicates no ACE permission required
+    --     jobs     = nil,     -- Nil indicates no framework job required
     --     minGrade = 0,
     --     menuPoint = {
-    --         coords = vector3(0.0, 0.0, 0.0),
+    --         coords = vector3(215.12, -805.23, 30.50),
     --         radius = 3.0,
-    --         marker = { type = 20, scale = 1.5, color = { r = 255, g = 165, b = 0 }, drawDistance = 15.0 },
+    --         marker = {
+    --             type         = 20,
+    --             scale        = 1.5,
+    --             colour       = { r = 255, g = 165, b = 0 },  -- Amber
+    --             drawDistance = 15.0,
+    --         },
     --     },
     --     bays = {
-    --         { id = 1, label = 'Bay 1', coords = vector3(0.0, 0.0, 0.0), heading = 0.0,
-    --           marker = { type = 36, scale = 1.5, color = { r = 0, g = 255, b = 0 } } },
+    --         {
+    --             id      = 1,
+    --             label   = 'Bay 1',
+    --             coords  = vector3(218.45, -810.12, 30.50),
+    --             heading = 90.0,
+    --             marker  = {
+    --                 type   = 36,
+    --                 scale  = 1.5,
+    --                 colour = { r = 0, g = 255, b = 0 },
+    --             },
+    --         },
     --     },
     --     vehicles = {
-    --         { label = 'Sultan RS', model = 'sultanrs' },
+    --         { label = 'Karin Sultan RS', model = 'sultanrs' },
+    --         { label = 'Bravado Buffalo STX', model = 'buffalos' },
     --     },
     -- },
 }
