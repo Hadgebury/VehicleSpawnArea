@@ -268,7 +268,15 @@ Notify Client (Error)               1. Record new spawn timestamp
 
 ## Licence
 
-This project is open-source under standard permissive terms. You are welcome to adapt, modify, and integrate this resource into your FiveM community with credit to the original author.
+This project is licensed under the **Creative Commons Attribution-NonCommercial 4.0 International Public License (CC BY-NC 4.0)**. See the full license text in [`LICENSE`](LICENSE).
+
+### Summary of Conditions
+
+- **Free to Use**: You are free to download, use, run, and host this resource on private or public FiveM servers at no cost.
+- **Modifications & Tailored Uses**: You are permitted to modify, adapt, refactor, and tailor the code to suit your server's specific frameworks, jobs, or mechanics.
+- **Strictly Non-Commercial**: You **may NOT** sell, resell, monetise, sub-license, or charge for this resource or any derivative works. This includes selling via Tebex, Patreon, subscription models, or paid server bundles.
+- **Mandatory Attribution**: You **MUST** give appropriate credit to the original author (**Hadgebury**) and retain a link to the original repository:
+  > **Note**: Attribution is required **even if the resource has been modified, refactored, renamed, or tailored** for your own custom implementation. Original copyright headers and notices must remain intact in all source files.
 
 ---
 

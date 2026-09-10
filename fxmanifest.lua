@@ -15,7 +15,8 @@ game 'gta5'
 -- Resource metadata
 author 'Hadgebury'
 description 'Multi-location Vehicle Spawn Area with framework support and layered permissions'
-version '2.0.0'
+version '1.2.0'
+license 'CC-BY-NC-4.0'
 
 -- Enable modern Lua 5.4 runtime (required for ox_lib and lexical scoping)
 lua54 'yes'
